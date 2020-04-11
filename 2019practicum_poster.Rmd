@@ -10,23 +10,444 @@ output: pdf_document
 knitr::opts_chunk$set(echo = TRUE)
 
 library(tidyverse)
-
+library(caret)
+library(glmnet)
+library(MASS)
+library(e1071)
+library(pROC)
+library(AppliedPredictiveModeling)
+library(rpart)
+library(rpart.plot)
+library(partykit)
+library(party)
+library(randomForest)
+library(ranger)
 
 ```
 
-
+# import data
 
 ```{r }
-screen <- read_csv("C:/Users/zzhao/Desktop/poster/data/screening.csv") 
+screen <- read_csv("C:/Users/zzhao/Desktop/poster/data/screening.csv") %>% 
+  janitor::clean_names()
 
 str(screen)
 
 ```
 
+# data cleaning
+
+```{r }
+# race
+screen <- screen %>% mutate(race_ethnicity = factor(race_ethnicity),
+                  race_ethnicity = relevel(race_ethnicity,
+                                           ref = "Non-Hispanic White"))
+
+# marital_status
+screen <- screen %>% mutate(marital_final = factor(marital_final),
+                  marital_final = relevel(marital_final,
+                                          ref = "Unmarried"))
+  
+# insurance
+screen <- screen %>% 
+  mutate(insurance = recode(insurance,
+                            "Medicare" = "public insur",
+                            "Medicaid" = "public insur",
+                            "Private insurance" = "private insur",
+                            "Uninsured/Unknown" = "uninsured"),
+         insurance = factor(insurance),
+         insurance = relevel(insurance,ref = "private insur"))
+
+# dx_year
+dx_year <- screen %>% pull(dx_year)
+dx_yr_cat <- rep(0,length(dx_year))
+for (i in 1:length(dx_year)) {
+  if (dx_year[i] < 2008) {
+    dx_yr_cat[i] = "< 2008"
+  } else if (dx_year[i] < 2011 & dx_year[i] >= 2008) {
+    dx_yr_cat[i] = "2008-2011"
+  } else if (dx_year[i] < 2014 & dx_year[i] >= 2011) {
+    dx_yr_cat[i] = "2011-2013"
+  } else {
+    dx_yr_cat[i] = "> 2013"
+  }
+}
+dx_yr_cat <- as.factor(dx_yr_cat) %>% 
+  relevel(ref = "< 2008")
+screen <- screen %>% 
+  mutate(dx_year = dx_yr_cat)
+
+# GT
+screen <- screen %>% mutate(gt_final = recode(gt_final,
+                                    "N" = "no",
+                                    "Y Unknown" = "no",
+                                    "Y unknown" = "no",
+                                    "Y -" = "neg",
+                                    "Y VUS" = "vus",
+                                    "Y +" = "pos"),
+                  gt_final = as.factor(gt_final),
+                  gt_final = relevel(gt_final,ref = "no"))
+
+# stage
+screen <- screen %>%  mutate(stage = factor(stage),
+                   stage = relevel(stage,ref = "1"))
+
+# FHX
+screen <- screen %>% mutate(fhx = factor(fhx),
+                  fhx = relevel(fhx,ref="No"))
+
+# supp_screening
+screen <- screen %>% mutate(supp_screening = factor(supp_screening),
+                  supp_screening = relevel(supp_screening,ref = "no"))
+
+# density_dx
+screen <- screen %>% mutate(density_dx = recode(density_dx, 
+                                                "1" = "1",
+                                                "2" = "1",
+                                                "3" = "2",
+                                                "4" = "2"), 
+                            density_dx = factor(density_dx),
+                            density_dx = relevel(density_dx,ref = "1"))
+
+# false positive
+f_p <- pull(screen,false_positive)
+f_p[which(is.na(f_p))] <- "N"
+f_p <- as.factor(f_p) %>% relevel(ref = "N")
+screen <- screen %>% mutate(false_positive = f_p)
+
+dat <- screen %>% select(ageatdiagnosis,race_ethnicity,
+                  marital_final,insurance,stage,
+                  fhx,dx_year,gt_final,supp_screening,
+                  density_dx,false_positive)
+
+
+```
+
+# Visualization
+
+```{r}
+theme1 <- transparentTheme(trans = 0.4)
+theme1$strip.background$col <- rgb(0.0,0.6,0.2,0.2)
+trellis.par.set(theme1)
+
+featurePlot(x = dat[,1],
+            y = dat$false_positive,
+            scales = list(x=list(relation = "free"),
+                          y=list(relation = "free")),
+            plot = "density", pch = "|",
+            auto.key = list(columns = 2))
+
+screen %>% group_by(false_positive,race_ethnicity) %>% 
+  summarize(freq = n()) %>% 
+  ggplot(aes(x = race_ethnicity,y = freq,fill = false_positive))+
+  geom_bar(stat = "identity",width = 0.5)+
+  scale_fill_manual("false positive",values = c("N" = "red","Y" = "blue"))
+
+screen[-rowTrain,] %>% group_by(false_positive) %>% 
+  summarize(n=n())
+  
+
+
+```
+
+
+
+# Models
+
+```{r}
+x <- model.matrix(false_positive~.,dat)[,-1]
+y <- dat$false_positive
+
+set.seed(2)
+rowTrain <- createDataPartition(y = dat$false_positive,
+                                p = 2/3,
+                                list = FALSE)  
+
+glm.fit <- glm(false_positive~.,
+               data = dat,
+               subset = rowTrain,
+               family = binomial)
+
+contrasts(dat$false_positive)
+
+summary(glm.fit)
+
+```
+
+```{r}
+test_pred_prob <- predict(glm.fit, newdata = dat[-rowTrain,],
+                          type = "response")
+test_pred <- rep("N",length(test_pred_prob))
+test_pred[test_pred_prob>0.5] <- "Y"
+
+caret::confusionMatrix(data = as.factor(test_pred),
+                       reference = dat$false_positive[-rowTrain],
+                       positive = "Y")
+
+
+```
+
+
+```{r}
+roc.glm <- roc(dat$false_positive[-rowTrain],test_pred_prob)
+plot(roc.glm,legacy.axes=TRUE,print.auc=TRUE)
+plot(smooth(roc.glm),col=4,add=TRUE)
+
+
+```
+
+
+
+```{r}
+ctrl1 <- trainControl(method = "repeatedcv",
+                      repeats = 5,
+                      summaryFunction = twoClassSummary,
+                      classProbs = TRUE)
+
+dat <- as.data.frame(dat)
+
+set.seed(2)
+model.glm <- train(x = dat[rowTrain,1:10],
+                   y = dat$false_positive[rowTrain],
+                   method = "glm",
+                   metric = "ROC",
+                   trControl = ctrl1)
+
+model.glm$results
+
+```
+
+
+
+```{r}
+glmnGrid <- expand.grid(.alpha = seq(0,1,length = 6),
+                        .lambda = exp(seq(-10,5,length = 40)))
+
+set.seed(2)
+model.glmn <- train(x=x[rowTrain,],
+                   y=y[rowTrain],
+                   method = "glmnet",
+                   tuneGrid = glmnGrid,
+                   metric = "ROC",
+                   trControl = ctrl1)
+
+plot(model.glmn,xTrans = function(x) log(x))
+
+model.glmn$bestTune
+
+```
+
+
+
+```{r}
+# use MASS
+lda.fit <- lda(false_positive~.,data=dat,
+               subset = rowTrain)
+
+plot(lda.fit)
+
+lda.pred <- predict(lda.fit,newdata = dat[-rowTrain,])
+head(lda.pred$posterior)
+
+roc.lda <- roc(dat$false_positive[-rowTrain],lda.pred$posterior[,2],
+                levels = c("N","Y"))
+
+plot(roc.lda,legacy.axes=TRUE,print.auc=TRUE)
+
+# Use caret
+set.seed(2)
+model.lda <- train(x=x[rowTrain,],
+                   y=y[rowTrain],
+                   method = "lda",
+                   metric = "ROC",
+                   trControl = ctrl1)
+
+model.lda$results
+
+```
+
+
+
+```{r}
+set.seed(2)
+model.qda <- train(x = x[rowTrain,],
+                   y = y[rowTrain],
+                   method = "qda",
+                   metric = "ROC",
+                   trControl = ctrl1)
+model.qda$results
+
+# use MASS
+qda.fit <- qda(false_positive~.,data=dat,
+               subset = rowTrain)
+
+qda.pred <- predict(qda.fit,newdata = dat[-rowTrain,])
+head(qda.pred$posterior)
+
+roc.qda <- roc(dat$false_positive[-rowTrain],qda.pred$posterior[,2],
+                levels = c("N","Y"))
+
+plot(roc.qda,legacy.axes=TRUE,print.auc=TRUE)
+
+```
+
+
+
+```{r nb}
+set.seed(2)
+nbGrid <- expand.grid(usekernel=c(FALSE,TRUE),
+                      fL=1,
+                      adjust=seq(0.2,8,by=0.2))
+
+model.nb <- train(x=dat[rowTrain,1:10],
+                  y=dat$false_positive[rowTrain],
+                  method = "nb",
+                  tuneGrid = nbGrid,
+                  metric = "ROC",
+                  trControl = ctrl1)
+
+plot(model.nb)
+
+model.nb$bestTune
+
+```
+
+
+
+```{r}
+res <- resamples(list(GLM = model.glm, GLMN = model.glmn,
+                 LDA = model.lda, QDA = model.qda,
+                 NB = model.nb))
+
+summary(res)
+
+```
+
+
+
+```{r plotROC}
+glm_pred <- predict(model.glm,newdata = dat[-rowTrain,],
+                    type="prob")[,2]
+glmn_pred <- predict(model.glmn,newdata = x[-rowTrain,],
+                     type = "prob")[,2]
+lda_pred <- predict(model.lda,newdata = x[-rowTrain,],
+                    type = "prob")[,2]
+qda_pred <- predict(model.qda,newdata = x[-rowTrain,],
+                    type = "prob")[,2]
+nb_pred <- predict(model.nb, newdata = dat[-rowTrain,],
+                   type = "prob")[,2]
+
+roc_glm <- roc(dat$false_positive[-rowTrain],glm_pred)
+roc_glmn <- roc(y[-rowTrain],glmn_pred)
+roc_lda <- roc(y[-rowTrain],lda_pred)
+roc_qda <- roc(y[-rowTrain],qda_pred)
+roc_nb <- roc(dat$false_positive[-rowTrain],nb_pred)
+
+auc <- c(roc_glm$auc[1],roc_glmn$auc[1],roc_lda$auc[1],
+         roc_qda$auc[1],roc_nb$auc[1])
+
+plot(roc_glm,legacy.axes=TRUE)
+plot(roc_glmn,col=2,add=TRUE)
+plot(roc_lda,col=3,add=TRUE)
+plot(roc_qda,col=4,add=TRUE)
+plot(roc_nb,col=5,add=TRUE)
+modelNames <- c("glm","glmn","lda","qda","nb")
+legend("bottomright",legend = paste0(modelNames,": ",round(auc,3)),
+       col = 1:6,lwd = 2)
+
+
+```
+
+
+
+```{r}
+# CART
+set.seed(2)
+rpart.fit <- train(false_positive~.,dat,
+                   subset = rowTrain,
+                   method="rpart",
+                   tuneGrid = data.frame(cp=exp(seq(-6,-4,len=20))),
+                   trControl=ctrl1,
+                   metric="ROC")
+
+ggplot(rpart.fit,highlight = TRUE)
+
+rpart.plot(rpart.fit$finalModel)
+
+```
+
+
+
+```{r}
+# CIT
+set.seed(2)
+ctree.fit <- train(false_positive~.,dat,
+                   subset = rowTrain,
+                   method = "ctree",
+                   tuneGrid = data.frame(mincriterion = 1-exp(seq(-10,0,length=50))),
+                   metric = "ROC",
+                   trControl = ctrl1)
+
+ggplot(ctree.fit,highlight = TRUE)
+
+plot(ctree.fit$finalModel)
+
+```
+
+
+
+```{r}
+rf.grid <- expand.grid(mtry=1:6,
+                       splitrule="gini",
+                       min.node.size=1:10)
+
+set.seed(2)
+rf.fit <- train(false_positive~.,dat,
+                subset=rowTrain,
+                method="ranger",
+                tuneGrid=rf.grid,
+                metric="ROC",
+                trControl=ctrl1)
+
+ggplot(rf.fit,highlight = TRUE)
+
+rf.pred <- predict(rf.fit,newdata = dat[-rowTrain,],type = "prob")[,1]
+
+```
+
+
+
+```{r binloss}
+gbmB.grid <- expand.grid(n.trees=c(2000,3000,4000),
+                         interaction.depth = 1:20,
+                         shrinkage = c(0.001,0.003,0.005),
+                         n.minobsinnode = 1)
+
+set.seed(2)
+gbmB.fit <- train(false_positive~.,dat,
+                  subset=rowTrain,
+                  tuneGrid = gbmB.grid,
+                  trControl = ctrl1,
+                  method = "gbm",
+                  distribution="bernoulli",
+                  metric = "ROC",
+                  verbose = FALSE)
+
+ggplot(gbmB.fit,highlight = TRUE)
+
+gbmB_pred <- predict(gbmB.fit,newdata = dat[-rowTrain,],type = "prob")[,1]
+
+```
+
 
 
 ```{r }
 
+
+
+
 ```
+
+
 
 
