@@ -272,6 +272,8 @@ model.lda <- train(x=x[rowTrain,],
 
 model.lda$results
 
+coef(model.lda$finalModel)
+
 ```
 
 
@@ -638,7 +640,7 @@ ice2_gbm_age <- gbmA.fit%>%
 
 
 ```{r}
-new_obs <- dat[-rowTrain,-11][1:2,]
+new_obs <- dat[-rowTrain,-11][1:3,]
 explainer.gbm <- lime(dat[rowTrain,-11],gbmA.fit)
 explanation.gbm <- explain(new_obs,explainer.gbm,n_features = 10,
                             labels = "Y")
