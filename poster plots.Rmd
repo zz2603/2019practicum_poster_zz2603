@@ -1,0 +1,38 @@
+---
+title: "poster plot"
+author: "Ziyi Zhao"
+date: "4/12/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+```
+
+
+
+```{r fig.width=12,fig.height=12}
+corrplot::corrplot(cor(x))
+
+
+```
+
+
+
+```{r }
+
+featurePlot(x = x,
+            y = y,
+            scales = list(x=list(relation = "free"),
+                          y=list(relation = "free")),
+            plot = "density", pch = "|",
+            auto.key = list(columns = 2))
+
+coef(model.glmn$finalModel,model.glmn$bestTune$lambda)
+
+
+```
+
+

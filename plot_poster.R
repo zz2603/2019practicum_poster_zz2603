@@ -8,3 +8,5 @@ featurePlot(x = x,
 pairs(dat[,1:10], pch = 19,  cex = 0.5,
       col = my_cols[dat$false_positive],
       lower.panel=NULL)
+
+corrplot::corrplot(cor(x))
