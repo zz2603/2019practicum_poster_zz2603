@@ -22,12 +22,17 @@ library(partykit)
 library(party)
 library(randomForest)
 library(ranger)
+library(pdp)
+library(gbm)
+library(plotmo)
+library(lime)
+
 
 ```
 
 # import data
 
-```{r }
+```{r include=FALSE}
 screen <- read_csv("C:/Users/zzhao/Desktop/poster/data/screening.csv") %>% 
   janitor::clean_names()
 
@@ -115,17 +120,20 @@ f_p[which(is.na(f_p))] <- "N"
 f_p <- as.factor(f_p) %>% relevel(ref = "N")
 screen <- screen %>% mutate(false_positive = f_p)
 
-dat <- screen %>% select(ageatdiagnosis,race_ethnicity,
+dat <- screen %>% dplyr::select(ageatdiagnosis,race_ethnicity,
                   marital_final,insurance,stage,
                   fhx,dx_year,gt_final,supp_screening,
                   density_dx,false_positive)
+
+x <- model.matrix(false_positive~.,dat)[,-1]
+y <- dat$false_positive
 
 
 ```
 
 # Visualization
 
-```{r}
+```{r fig.width=9,fig.height=7.5}
 theme1 <- transparentTheme(trans = 0.4)
 theme1$strip.background$col <- rgb(0.0,0.6,0.2,0.2)
 trellis.par.set(theme1)
@@ -137,16 +145,19 @@ featurePlot(x = dat[,1],
             plot = "density", pch = "|",
             auto.key = list(columns = 2))
 
-screen %>% group_by(false_positive,race_ethnicity) %>% 
-  summarize(freq = n()) %>% 
-  ggplot(aes(x = race_ethnicity,y = freq,fill = false_positive))+
-  geom_bar(stat = "identity",width = 0.5)+
-  scale_fill_manual("false positive",values = c("N" = "red","Y" = "blue"))
-
-screen[-rowTrain,] %>% group_by(false_positive) %>% 
-  summarize(n=n())
+featurePlot(x = x,
+            y = y,
+            scales = list(x=list(relation = "free"),
+                          y=list(relation = "free")),
+            plot = "density", pch = "|",
+            auto.key = list(columns = 2))
   
+my_cols <- c("blue", "purple")  
+pairs(dat[,1:10], pch = 19,  cex = 0.5,
+      col = my_cols[dat$false_positive],
+      lower.panel=NULL)
 
+corrplot::corrplot(cor(x))
 
 ```
 
@@ -155,9 +166,6 @@ screen[-rowTrain,] %>% group_by(false_positive) %>%
 # Models
 
 ```{r}
-x <- model.matrix(false_positive~.,dat)[,-1]
-y <- dat$false_positive
-
 set.seed(2)
 rowTrain <- createDataPartition(y = dat$false_positive,
                                 p = 2/3,
@@ -374,6 +382,9 @@ ggplot(rpart.fit,highlight = TRUE)
 
 rpart.plot(rpart.fit$finalModel)
 
+rpart.pred <- predict(rpart.fit,newdata = dat[-rowTrain,],
+                      type = "prob")[,1]
+
 ```
 
 
@@ -391,6 +402,9 @@ ctree.fit <- train(false_positive~.,dat,
 ggplot(ctree.fit,highlight = TRUE)
 
 plot(ctree.fit$finalModel)
+
+ctree.pred <- predict(ctree.fit,newdata = dat[-rowTrain,],
+                      type = "prob")[,1]
 
 ```
 
@@ -441,12 +455,242 @@ gbmB_pred <- predict(gbmB.fit,newdata = dat[-rowTrain,],type = "prob")[,1]
 
 
 
-```{r }
+```{r adaboost}
+gbmA.grid <- expand.grid(n.trees = c(2000,3000,4000),
+                         interaction.depth = 1:20,
+                         shrinkage = c(0.001,0.003,0.005),
+                         n.minobsinnode = 1)
+
+set.seed(2)
+gbmA.fit <- train(false_positive~., dat,
+                  subset=rowTrain,
+                  tuneGrid = gbmA.grid,
+                  trControl = ctrl1,
+                  method = "gbm",
+                  distribution="adaboost",
+                  metric="ROC",
+                  verbose=FALSE)
+
+ggplot(gbmA.fit,hightlight=TRUE)
+
+gbmA_pred <- predict(gbmA.fit,newdata = dat[-rowTrain,],type = "prob")[,1]
+
+```
 
 
+
+```{r resamp}
+resamp <- resamples(list(rf=rf.fit,
+                         gbmA=gbmA.fit,
+                         gbmB=gbmB.fit,
+                         rpart=rpart.fit,
+                         ctree=ctree.fit))
+
+summary(resamp)
+
+```
+
+
+
+```{r varimp}
+set.seed(2)
+rf2.final.per <- ranger(false_positive~.,dat[rowTrain,],
+                        mtry=3,
+                        min.node.size=5,
+                        splitrule = "gini",
+                        importance = "permutation",
+                        scale.permutation.importance = TRUE)
+
+barplot(sort(ranger::importance(rf2.final.per),decreasing = FALSE),
+        las = 2, horiz = TRUE,cex.names = 0.7,
+        col=colorRampPalette(colors = c("cyan","blue"))(8))
+
+set.seed(2)
+rf2.final.imp <- ranger(false_positive~.,dat[rowTrain,],
+                        mtry = 3,splitrule = "gini",
+                        min.node.size = 5,
+                        importance = "impurity")
+
+barplot(sort(ranger::importance(rf2.final.imp),decreasing = FALSE),
+        las=2,horiz=TRUE,cex.names = 0.7,
+        col = colorRampPalette(colors = c("cyan","blue"))(8))
+
+summary(gbmA.fit$finalModel,las=2,cBars=19,cex.names=0.6)
+
+```
+
+
+
+```{r pdp}
+# supp_screening
+pdp.rf <- rf.fit %>% 
+  pdp::partial(pred.var = "supp_screening",
+          grid.resolution = 100,
+          prob = TRUE) %>% 
+  autoplot(rug = TRUE,train = dat[rowTrain,])+
+  ggtitle("Randome forest")
+
+pdp.gbm <- gbmA.fit %>% 
+  pdp::partial(pred.var = "supp_screening",
+               grid.solution = 100,
+               prob = "TRUE") %>% 
+  autoplot(rug = TRUE, train = dat[rowTrain,])+
+  ggtitle("Boosting")
+
+grid.arrange(pdp.rf,pdp.gbm,nrow=1)
+
+
+# age at diagnosis
+pdp_rf_age <- rf.fit %>% 
+  pdp::partial(pred.var = "ageatdiagnosis",
+          grid.resolution = 100,
+          prob = TRUE) %>% 
+  autoplot(rug = TRUE,train = dat[rowTrain,])+
+  ggtitle("Randome forest")
+
+pdp_gbm_age <- gbmA.fit %>% 
+  pdp::partial(pred.var = "ageatdiagnosis",
+               grid.solution = 100,
+               prob = "TRUE") %>% 
+  autoplot(rug = TRUE, train = dat[rowTrain,])+
+  ggtitle("Boosting")
+
+grid.arrange(pdp_rf_age,pdp_gbm_age,nrow=1)
+
+```
+
+
+
+```{r}
+# supp_screening
+ice1.rf <- rf.fit %>% 
+  pdp::partial(pred.var = "supp_screening",
+               grid.resolution = 100,
+               ice = TRUE,
+               prob = TRUE) %>% 
+  autoplot(train = dat[rowTrain,],alpha=0.1)+
+  ggtitle("Random forest, non-centered")
+
+ice2.rf <- rf.fit %>% 
+  pdp::partial(pred.var = "supp_screening",
+               grid.resolution = 100,
+               ice = TRUE,
+               prob = TRUE) %>% 
+  autoplot(train = dat[rowTrain,],alpha=0.1,
+           center = TRUE)+
+  ggtitle("Random forest, centered")
+
+ice1.gbm <- gbmA.fit %>% 
+  pdp::partial(pred.var = "supp_screening",
+               grid.resolution = 100,
+               ice = TRUE,
+               prob = TRUE) %>% 
+  autoplot(train = dat[rowTrain,],alpha = 0.1)+
+  ggtitle("Boosting, non-centered")
+
+ice2.gbm <- gbmA.fit%>% 
+  pdp::partial(pred.var = "supp_screening",
+               grid.resolution = 100,
+               ice = TRUE,
+               prob = TRUE) %>% 
+  autoplot(train = dat[rowTrain,],alpha = 0.1,
+           center = TRUE)+
+  ggtitle("Boosting, centered")
+
+# age at diagnosis
+ice1_rf_age <- rf.fit %>% 
+  pdp::partial(pred.var = "ageatdiagnosis",
+               grid.resolution = 100,
+               ice = TRUE,
+               prob = TRUE) %>% 
+  autoplot(train = dat[rowTrain,],alpha=0.1)+
+  ggtitle("Random forest, non-centered")
+
+ice2_rf_age <- rf.fit %>% 
+  pdp::partial(pred.var = "ageatdiagnosis",
+               grid.resolution = 100,
+               ice = TRUE,
+               prob = TRUE) %>% 
+  autoplot(train = dat[rowTrain,],alpha=0.1,
+           center = TRUE)+
+  ggtitle("Random forest, centered")
+
+ice1_gbm_age <- gbmA.fit %>% 
+  pdp::partial(pred.var = "ageatdiagnosis",
+               grid.resolution = 100,
+               ice = TRUE,
+               prob = TRUE) %>% 
+  autoplot(train = dat[rowTrain,],alpha = 0.1)+
+  ggtitle("Boosting, non-centered")
+
+ice2_gbm_age <- gbmA.fit%>% 
+  pdp::partial(pred.var = "ageatdiagnosis",
+               grid.resolution = 100,
+               ice = TRUE,
+               prob = TRUE) %>% 
+  autoplot(train = dat[rowTrain,],alpha = 0.1,
+           center = TRUE)+
+  ggtitle("Boosting, centered")
 
 
 ```
+
+
+
+```{r}
+new_obs <- dat[-rowTrain,-11][1:2,]
+explainer.gbm <- lime(dat[rowTrain,-11],gbmA.fit)
+explanation.gbm <- explain(new_obs,explainer.gbm,n_features = 10,
+                            labels = "Y")
+
+plot_features(explanation.gbm)
+
+```
+
+
+
+```{r}
+plot_explanations(explanation.gbm)
+```
+
+
+
+```{r}
+explainer.rf <- lime(dat[rowTrain,-11],rf.fit)
+explanation.rf <- explain(new_obs,explainer.rf,n_features = 10,
+                          labels = "Y")
+
+plot_features(explanation.rf)
+
+plot_explanations(explanation.rf)
+
+```
+
+
+
+```{r}
+roc.rpart <- roc(dat$false_positive[-rowTrain],rpart.pred)
+roc.ctree <- roc(dat$false_positive[-rowTrain],ctree.pred)
+roc.rf <- roc(dat$false_positive[-rowTrain],rf.pred)
+roc.gbmA <- roc(dat$false_positive[-rowTrain],gbmA_pred)
+roc.gbmB <- roc(dat$false_positive[-rowTrain],gbmB_pred)
+
+auc1 <- c(roc.rpart$auc[1],roc.ctree$auc[1],roc.rf$auc[1],
+          roc.gbmA$auc[1],roc.gbmB$auc[1]) 
+
+modelNames1 <- c("rpart_caret", "ctree", "rf", "gbmA", "gbmB")
+
+plot(roc.rpart)
+plot(roc.ctree,add = TRUE,col = 2)
+plot(roc.rf, add = TRUE, col = 3)
+plot(roc.gbmA, add = TRUE, col = 4)
+plot(roc.gbmB, add = TRUE, col = 5)
+legend("bottomright",legend=paste0(modelNames1,": ", round(auc,3)),
+       col = 1:5, lwd = 2)
+
+
+```
+
 
 
 
